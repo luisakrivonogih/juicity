@@ -19,6 +19,7 @@ import (
 
 	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/dialer"
+	_ "github.com/daeuniverse/outbound/dialer/socks" // socks5:// user outbounds
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
@@ -54,6 +55,21 @@ type Options struct {
 	SendThrough           string
 	DialerLink            string
 	DisableOutboundUdp443 bool
+	// UserOutbounds overrides, per user UUID, how that user's traffic leaves.
+	UserOutbounds map[string]UserOutbound
+}
+
+// UserOutbound is one user's own way out: Mark sets SO_MARK on every socket
+// opened for them (policy routing, traffic shaping); Socks5 ("host:port"),
+// when set, sends their traffic to that SOCKS5 server instead of directly.
+type UserOutbound struct {
+	Mark   int
+	Socks5 string
+}
+
+type userRoute struct {
+	dialer netproxy.Dialer
+	mark   uint32
 }
 
 type Server struct {
@@ -65,6 +81,7 @@ type Server struct {
 	congestionControl      string
 	cwnd                   int
 	users                  map[uuid.UUID]string
+	userRoutes             map[uuid.UUID]userRoute
 	fwmark                 int
 	disableOutboundUdp443  bool
 	inFlightUnderlayKey    *InFlightUnderlayKey
@@ -114,6 +131,24 @@ func New(opts *Options) (*Server, error) {
 			Msg("Dial use given dialer")
 	}
 
+	userRoutes := map[uuid.UUID]userRoute{}
+	for _uuid, ob := range opts.UserOutbounds {
+		id, err := uuid.Parse(_uuid)
+		if err != nil {
+			return nil, fmt.Errorf("parse user_outbounds uuid(%v): %w", _uuid, err)
+		}
+		if ob.Mark < 0 || uint64(ob.Mark) > 0xffffffff {
+			return nil, fmt.Errorf("user_outbounds(%v): mark out of range", _uuid)
+		}
+		var ud netproxy.Dialer = direct.SymmetricDirect
+		if ob.Socks5 != "" {
+			if ud, _, err = dialer.NewNetproxyDialerFromLink(ud, &dialer.ExtraOption{}, "socks5://"+ob.Socks5); err != nil {
+				return nil, fmt.Errorf("user_outbounds(%v): parse socks5: %w", _uuid, err)
+			}
+		}
+		userRoutes[id] = userRoute{dialer: ud, mark: uint32(ob.Mark)}
+	}
+
 	return &Server{
 		logger:                 opts.Logger,
 		relay:                  relay.NewRelay(opts.Logger),
@@ -123,6 +158,7 @@ func New(opts *Options) (*Server, error) {
 		congestionControl:      opts.CongestionControl,
 		cwnd:                   10,
 		users:                  users,
+		userRoutes:             userRoutes,
 		fwmark:                 opts.Fwmark,
 		disableOutboundUdp443:  opts.DisableOutboundUdp443,
 		inFlightUnderlayKey:    NewInFlightUnderlayKey(inFlightUnderlayTtl),
@@ -278,12 +314,14 @@ func (s *Server) handleConn(conn quic.Connection) (err error) {
 	defer cancel()
 	authCtx, authDone := context.WithTimeout(ctx, AuthenticateTimeout)
 	defer authDone()
+	// Written before authDone(); streams read it only after <-authCtx.Done().
+	var user *uuid.UUID
 	go func() {
 		var (
 			uniStream quic.ReceiveStream
 			err       error
 		)
-		if _, uniStream, err = s.handleConnAuth(authCtx, conn); err != nil {
+		if user, uniStream, err = s.handleConnAuth(authCtx, conn); err != nil {
 			s.logger.Warn().
 				Err(err).
 				Msg("handleAuth")
@@ -318,7 +356,7 @@ func (s *Server) handleConn(conn quic.Connection) (err error) {
 			return err
 		}
 		go func(stream quic.Stream) {
-			if err = s.handleStream(ctx, authCtx, conn, stream); err != nil {
+			if err = s.handleStream(ctx, authCtx, conn, stream, &user); err != nil {
 				s.logger.Warn().
 					Err(err).
 					Send()
@@ -327,7 +365,18 @@ func (s *Server) handleConn(conn quic.Connection) (err error) {
 	}
 }
 
-func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn quic.Connection, stream quic.Stream) error {
+// route is how one authenticated user's traffic leaves: their own
+// outbound if configured, the server's otherwise.
+func (s *Server) route(user *uuid.UUID) (netproxy.Dialer, uint32) {
+	if user != nil {
+		if r, ok := s.userRoutes[*user]; ok {
+			return r.dialer, r.mark
+		}
+	}
+	return s.dialer, uint32(s.fwmark)
+}
+
+func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn quic.Connection, stream quic.Stream, user **uuid.UUID) error {
 	lConn := juicity.NewConn(stream, nil, nil)
 	defer lConn.Close()
 	// Read the header and initiate the metadata
@@ -343,6 +392,7 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 	}
 	mdata := lConn.Metadata
 	source := conn.RemoteAddr().String()
+	d, mark := s.route(*user)
 	switch mdata.Network {
 	case "tcp":
 		target := net.JoinHostPort(mdata.Hostname, strconv.Itoa(int(mdata.Port)))
@@ -352,11 +402,11 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 			Msg("juicity received a [tcp] request")
 		magicNetwork := netproxy.MagicNetwork{
 			Network: "tcp",
-			Mark:    uint32(s.fwmark),
+			Mark:    mark,
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), consts.DefaultDialTimeout)
 		defer cancel()
-		rConn, err := s.dialer.DialContext(ctx, magicNetwork.Encode(), target)
+		rConn, err := d.DialContext(ctx, magicNetwork.Encode(), target)
 		if err != nil {
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
@@ -394,11 +444,11 @@ func (s *Server) handleStream(ctx context.Context, authCtx context.Context, conn
 
 		magicNetwork := netproxy.MagicNetwork{
 			Network: "udp",
-			Mark:    uint32(s.fwmark),
+			Mark:    mark,
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), consts.DefaultDialTimeout)
 		defer cancel()
-		c, err := s.dialer.DialContext(ctx, magicNetwork.Encode(), addr.String())
+		c, err := d.DialContext(ctx, magicNetwork.Encode(), addr.String())
 		s.logger.Debug().
 			Str("target", addr.String()).
 			Str("source", source).

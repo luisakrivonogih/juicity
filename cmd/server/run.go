@@ -72,6 +72,10 @@ func Serve(conf *config.Config) (err error) {
 			return fmt.Errorf("fwmark is too large")
 		}
 	}
+	userOutbounds := make(map[string]server.UserOutbound, len(conf.UserOutbounds))
+	for id, ob := range conf.UserOutbounds {
+		userOutbounds[id] = server.UserOutbound{Mark: ob.Mark, Socks5: ob.Socks5}
+	}
 	s, err := server.New(&server.Options{
 		Logger:                logger,
 		Users:                 conf.Users,
@@ -82,6 +86,7 @@ func Serve(conf *config.Config) (err error) {
 		SendThrough:           conf.SendThrough,
 		DialerLink:            conf.DialerLink,
 		DisableOutboundUdp443: conf.DisableOutboundUdp443,
+		UserOutbounds:         userOutbounds,
 	})
 	if err != nil {
 		return err

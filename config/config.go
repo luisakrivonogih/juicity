@@ -28,11 +28,20 @@ type Config struct {
 	SendThrough           string            `json:"send_through"`
 	DialerLink            string            `json:"dialer_link"`
 	DisableOutboundUdp443 bool              `json:"disable_outbound_udp443"`
+	// UserOutbounds overrides, per user UUID, how that user's traffic leaves.
+	UserOutbounds map[string]UserOutbound `json:"user_outbounds"`
 
 	// Common
 	Listen            string `json:"listen"`
 	CongestionControl string `json:"congestion_control"`
 	LogLevel          string `json:"log_level"`
+}
+
+// UserOutbound: Mark sets SO_MARK on the user's sockets; Socks5 ("host:port")
+// sends the user's traffic to that SOCKS5 server.
+type UserOutbound struct {
+	Mark   int    `json:"mark"`
+	Socks5 string `json:"socks5"`
 }
 
 func ReadConfig(p string) (*Config, error) {
